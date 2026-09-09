@@ -5,6 +5,7 @@
   "poll_seconds": 3,
   "max_age_seconds": 300,
   "vision_enabled": true,
+  "ocr_enabled": true,
   "realtime_enabled": true,
   "stickers_enabled": true,
   "social_memory_enabled": true,

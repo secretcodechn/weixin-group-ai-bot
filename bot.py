@@ -14,7 +14,8 @@ import time
 import xml.etree.ElementTree as ET
 
 from ai_client import AIClient
-from image_context import ImageContext, ImageUnavailable
+from image_context import ImageUnavailable
+from ocr_context import OCRImageContext as ImageContext, trim_image_context
 from group_names import display_name, member_names
 from realtime import Weather, chat_complete, clock_context
 from native_stickers import NativeStickers, STICKER_TOOLS
@@ -153,7 +154,8 @@ class Bot:
         """)
         self.ai = AIClient()
         self.weather = Weather() if self.config.get('realtime_enabled', True) else None
-        self.images = (ImageContext(ROOT, self.state, self.ai, self.config['bot_id'])
+        self.images = (ImageContext(ROOT, self.state, self.ai, self.config['bot_id'],
+                                   ocr_enabled=self.config.get('ocr_enabled', True))
                        if self.config.get('vision_enabled', False) else None)
         self.stickers = (NativeStickers(self.ai, lambda group: self.ui('ready', group, allow_profile_refresh=True))
                          if self.config.get('stickers_enabled', False) else None)
@@ -481,7 +483,8 @@ class Bot:
         notes = []
         for item in reversed(chosen):
             try:
-                caption = self.images.describe(base.parent, group_id, item['shard'], item)
+                caption = self.images.describe(base.parent, group_id, item['shard'], item,
+                    question=trigger['prompt'], max_chars=max(700, 2600 // len(chosen)))
                 notes.append('图片识别结果：' + caption)
             except ImageUnavailable as exc:
                 notes.append('图片未能识别：' + str(exc) + '。不能据此猜测图片内容。')
@@ -596,6 +599,9 @@ class Bot:
             messages = self.message_payload(group, history, sender, trigger['prompt'], summary, image_context, social_context)
         if estimate_tokens(messages) > budget and social_context:
             # Optional personalization must never displace an otherwise valid question.
+            messages = self.message_payload(group, history, sender, trigger['prompt'], summary, image_context)
+        while image_context and estimate_tokens(messages) > budget and len(image_context) > 150:
+            image_context = trim_image_context(image_context, max(100, int(len(image_context) * .7)))
             messages = self.message_payload(group, history, sender, trigger['prompt'], summary, image_context)
         if estimate_tokens(messages) > budget:
             raise RuntimeError('Question and image descriptions exceed the context budget')
