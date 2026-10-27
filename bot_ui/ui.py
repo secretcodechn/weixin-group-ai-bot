@@ -13,6 +13,7 @@ from Xlib import display, error
 from PIL import Image, ImageChops, ImageStat
 
 ROOT = Path(__file__).resolve().parent
+IMAGE_PREVIEW_TITLE = '图片和视频'
 os.environ['DISPLAY'] = ':1'
 
 
@@ -41,7 +42,7 @@ def main_window(d, expected_signature: dict[str, int | str] | None = None) -> Wi
         w = d.create_resource_object('window', int(identifier))
         if 'wechat' in str(w.get_wm_class()).lower() and w.get_attributes().map_state == 2:
             title = w.get_full_property(title_atom, utf8_atom)
-            if title and title.value.decode('utf-8', errors='replace') == '图片和视频':
+            if title and title.value.decode('utf-8', errors='replace') == IMAGE_PREVIEW_TITLE:
                 continue
             g = w.get_geometry()
             if g.width >= 800 and g.height >= 600:
@@ -70,6 +71,51 @@ def verify(d, w, template):
     active = d.screen().root.get_full_property(d.intern_atom('_NET_ACTIVE_WINDOW'), 0)
     if not active or int(active.value[0]) != w.id:
         raise RuntimeError('WeChat is not the active window')
+
+
+def close_stale_image_preview(d: display.Display, main: Window) -> None:
+    """Close a uniquely identified image viewer left open after interrupted work.
+
+    Args:
+        d: X11 display connection.
+        main: The uniquely identified WeChat chat window.
+
+    Raises:
+        RuntimeError: Multiple image viewers are visible or the viewer will not close.
+    """
+    root = d.screen().root
+    prop = root.get_full_property(d.intern_atom('_NET_CLIENT_LIST'), 0)
+    title_atom = d.intern_atom('_NET_WM_NAME')
+    utf8_atom = d.intern_atom('UTF8_STRING')
+    previews = []
+    for identifier in prop.value if prop else []:
+        window = d.create_resource_object('window', int(identifier))
+        if 'wechat' not in str(window.get_wm_class()).lower():
+            continue
+        if window.get_attributes().map_state != 2:
+            continue
+        title = window.get_full_property(title_atom, utf8_atom)
+        if title and title.value.decode('utf-8', errors='replace') == IMAGE_PREVIEW_TITLE:
+            previews.append(window)
+    if not previews:
+        return
+    if len(previews) != 1:
+        raise RuntimeError('Multiple WeChat image previews are visible')
+
+    preview = previews[0]
+    xdo('windowactivate', '--sync', preview.id)
+    xdo('key', '--clearmodifiers', 'Escape')
+    time.sleep(.2)
+    try:
+        preview_visible = preview.get_attributes().map_state == 2
+    except error.BadWindow:
+        preview_visible = False
+    if preview_visible:
+        raise RuntimeError('Stale WeChat image preview did not close')
+    xdo('windowactivate', '--sync', main.id)
+    active = root.get_full_property(d.intern_atom('_NET_ACTIVE_WINDOW'), 0)
+    if not active or int(active.value[0]) != main.id:
+        raise RuntimeError('WeChat chat window could not be reactivated')
 
 
 def window_image(w: Window) -> Image.Image:
@@ -324,6 +370,7 @@ def main() -> None:
     d = display.Display(':1')
     w = main_window(d, profile_hint.get('signature') if profile_hint else None)
     if action == 'logged-in':
+        close_stale_image_preview(d, w)
         print('WeChat is logged in')
         return
     if action != 'close-image':
