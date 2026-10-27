@@ -35,9 +35,14 @@ def main_window(d, expected_signature: dict[str, int | str] | None = None) -> Wi
     """
     prop = d.screen().root.get_full_property(d.intern_atom('_NET_CLIENT_LIST'), 0)
     candidates = []
+    title_atom = d.intern_atom('_NET_WM_NAME')
+    utf8_atom = d.intern_atom('UTF8_STRING')
     for identifier in prop.value if prop else []:
         w = d.create_resource_object('window', int(identifier))
         if 'wechat' in str(w.get_wm_class()).lower() and w.get_attributes().map_state == 2:
+            title = w.get_full_property(title_atom, utf8_atom)
+            if title and title.value.decode('utf-8', errors='replace') == '图片和视频':
+                continue
             g = w.get_geometry()
             if g.width >= 800 and g.height >= 600:
                 candidates.append(w)
