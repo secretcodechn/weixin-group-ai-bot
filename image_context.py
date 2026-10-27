@@ -8,9 +8,11 @@ import io
 import json
 import re
 import struct
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable, Mapping
 
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -18,6 +20,7 @@ from PIL import Image
 
 
 MAX_BYTES = 12 * 1024 * 1024
+ImageCandidate = tuple[Path, bytes, bytes, str]
 
 
 class ImageUnavailable(RuntimeError):
@@ -88,19 +91,54 @@ def normalize_image(data):
 
 
 class ImageContext:
-    def __init__(self, root, state, ai, bot_id):
+    def __init__(self, root: Path, state: Any, ai: Any, bot_id: str) -> None:
+        """Initialize group-scoped image caches and optional UI fetching.
+
+        Args:
+            root: Bot workspace containing WeChat data and private configuration.
+            state: Writable bot-state SQLite connection.
+            ai: Client that describes normalized images.
+            bot_id: Logged-in WeChat account ID.
+        """
         self.root, self.state, self.ai, self.bot_id = Path(root), state, ai, bot_id
+        self.image_fetcher: Callable[[str, Mapping[str, Any], bytes], None] | None = None
+        self.image_closer: Callable[[str], None] | None = None
         state.execute('''CREATE TABLE IF NOT EXISTS image_memory(
             group_id TEXT, shard TEXT, local_id INTEGER, image_hash TEXT, summary TEXT,
             PRIMARY KEY(group_id,shard,local_id))''')
+        state.execute('''CREATE TABLE IF NOT EXISTS image_fetch_attempts(
+            group_id TEXT, shard TEXT, local_id INTEGER, preview_hash TEXT, attempted INTEGER,
+            PRIMARY KEY(group_id,shard,local_id))''')
         state.commit()
 
-    def cached(self, group_id, shard, local_id):
+    def cached(self, group_id: str, shard: str, local_id: int) -> str | None:
+        """Return a previously stored description for one group image.
+
+        Args:
+            group_id: Group containing the image.
+            shard: Message database shard containing the image.
+            local_id: Local image message ID.
+
+        Returns:
+            The cached image description, or None if this image has not been read.
+        """
         row = self.state.execute('SELECT summary FROM image_memory WHERE group_id=? AND shard=? AND local_id=?',
                                  (group_id, shard, local_id)).fetchone()
         return row[0] if row else None
 
-    def keys(self, account, sample):
+    def keys(self, account: Path, sample: bytes) -> tuple[bytes, int | None]:
+        """Find and verify this account's local image decryption key.
+
+        Args:
+            account: Logged-in WeChat account directory.
+            sample: Encrypted image attachment used to validate a candidate key.
+
+        Returns:
+            The verified AES key and optional XOR key.
+
+        Raises:
+            ImageUnavailable: No key can decode the supplied attachment.
+        """
         key_path = self.root / 'image_keys.json'
         if key_path.exists():
             cfg = json.loads(key_path.read_text())
@@ -128,7 +166,21 @@ class ImageContext:
                         continue
         raise ImageUnavailable('当前账号的图片解密密钥尚未就绪')
 
-    def paths(self, account, group_id, item):
+    def paths(
+        self, account: Path, group_id: str, item: Mapping[str, Any], *,
+        include_previews: bool = True,
+    ) -> list[Path]:
+        """Return this image's local attachment variants, highest quality first.
+
+        Args:
+            account: Logged-in WeChat account directory.
+            group_id: Numeric ID of the current group.
+            item: Message row containing its timestamp and attachment metadata.
+            include_previews: Whether to include bubble and thumbnail caches.
+
+        Returns:
+            Existing image paths confined to this account's directory.
+        """
         if not re.fullmatch(r'[0-9]+@chatroom', group_id):
             raise ImageUnavailable('无效图片会话')
         packed = item.get('packed_info_data') or b''
@@ -139,35 +191,221 @@ class ImageContext:
         month = datetime.fromtimestamp(item['create_time']).strftime('%Y-%m')
         folder = account / 'msg/attach' / group_hash / month / 'Img'
         bubble = account / 'cache' / month / 'Message' / group_hash / 'Bubble'
+        paths = []
         for file_hash in hashes:
-            for path in (folder / (file_hash + '.dat'), folder / (file_hash + '_h.dat'),
-                         bubble / (file_hash + '_b.dat'), folder / (file_hash + '_t.dat')):
+            variants = [folder / (file_hash + '.dat'), folder / (file_hash + '_h.dat')]
+            if include_previews:
+                variants.extend((bubble / (file_hash + '_b.dat'), folder / (file_hash + '_t.dat')))
+            for path in variants:
                 if path.is_file() and path.resolve().is_relative_to(account.resolve()):
-                    yield path
+                    paths.append(path)
+        return paths
 
-    def describe(self, account, group_id, shard, item):
-        cached = self.cached(group_id, shard, item['local_id'])
-        if cached:
-            return cached
+    def load_path(self, account: Path, path: Path) -> tuple[bytes, bytes, str]:
+        """Decode and normalize one local image variant.
+
+        Args:
+            account: Logged-in WeChat account directory.
+            path: A candidate path returned by ``paths``.
+
+        Returns:
+            Decoded source bytes, normalized upload bytes, and MIME type.
+        """
+        with path.open('rb') as f:
+            data = f.read(MAX_BYTES + 1)
+        if len(data) > MAX_BYTES:
+            raise ImageUnavailable('图片超过大小限制')
+        key, xor = self.keys(account, data) if data[:6] == b'\x07\x08V2\x08\x07' else (None, None)
+        decoded = decode_dat(data, key, xor)
+        image, mime = normalize_image(decoded)
+        return decoded, image, mime
+
+    def load_first(
+        self, account: Path, paths: list[Path],
+    ) -> tuple[ImageCandidate | None, ImageUnavailable]:
+        """Load the first decodable candidate while retaining the last local error.
+
+        Args:
+            account: Logged-in WeChat account directory.
+            paths: Candidate attachment paths in quality order.
+
+        Returns:
+            The first decoded candidate and the most recent decode error.
+        """
         last_error = ImageUnavailable('这张图片还没有下载到本机')
-        for path in self.paths(account, group_id, item):
+        for path in paths:
             try:
-                with path.open('rb') as f:
-                    data = f.read(MAX_BYTES + 1)
-                if len(data) > MAX_BYTES:
-                    raise ImageUnavailable('图片超过大小限制')
-                key, xor = self.keys(account, data) if data[:6] == b'\x07\x08V2\x08\x07' else (None, None)
-                image, mime = normalize_image(decode_dat(data, key, xor))
+                decoded, image, mime = self.load_path(account, path)
             except (ImageUnavailable, OSError) as exc:
-                last_error = exc
+                last_error = (
+                    exc if isinstance(exc, ImageUnavailable)
+                    else ImageUnavailable('本机图片暂时无法读取')
+                )
                 continue
-            summary, _ = self.ai.describe_image(image, mime)
-            if path.stem.endswith('_t'):
-                summary = '（依据缩略图，细节可能不清晰）' + summary
-            with self.state:
-                self.state.execute('INSERT OR REPLACE INTO image_memory VALUES(?,?,?,?,?)',
-                    (group_id, shard, item['local_id'], hashlib.sha256(image).hexdigest(), summary))
-            return summary
-        if isinstance(last_error, ImageUnavailable):
-            raise last_error
-        raise ImageUnavailable('本机图片暂时无法读取') from None
+            return (path, decoded, image, mime), last_error
+        return None, last_error
+
+    def fetch_attempted_recently(
+        self, group_id: str, shard: str, local_id: int, preview_hash: str,
+    ) -> bool:
+        """Check whether this unchanged preview recently triggered a UI fetch.
+
+        Args:
+            group_id: Group containing the image.
+            shard: Message database shard containing the image.
+            local_id: Local image message ID.
+            preview_hash: Hash of the normalized preview used for matching.
+
+        Returns:
+            True when the same preview was attempted within ten minutes.
+        """
+        row = self.state.execute(
+            'SELECT preview_hash,attempted FROM image_fetch_attempts '
+            'WHERE group_id=? AND shard=? AND local_id=?',
+            (group_id, shard, local_id),
+        ).fetchone()
+        return bool(row and row[0] == preview_hash and time.time() - row[1] < 600)
+
+    def remember_fetch_attempt(
+        self, group_id: str, shard: str, local_id: int, preview_hash: str,
+    ) -> None:
+        """Record one bounded attempt to open this image in WeChat.
+
+        Args:
+            group_id: Group containing the image.
+            shard: Message database shard containing the image.
+            local_id: Local image message ID.
+            preview_hash: Hash of the normalized preview used for matching.
+        """
+        attempted = int(time.time())
+        with self.state:
+            self.state.execute(
+                'DELETE FROM image_fetch_attempts WHERE attempted<?',
+                (attempted - 600,),
+            )
+            self.state.execute(
+                'INSERT OR REPLACE INTO image_fetch_attempts VALUES(?,?,?,?,?)',
+                (group_id, shard, local_id, preview_hash, attempted),
+            )
+            self.state.execute(
+                'DELETE FROM image_fetch_attempts WHERE rowid IN ( '
+                'SELECT rowid FROM image_fetch_attempts ORDER BY attempted DESC '
+                'LIMIT -1 OFFSET 1000)'
+            )
+
+    def forget_fetch_attempt(self, group_id: str, shard: str, local_id: int) -> None:
+        """Clear the fetch cooldown after a full-resolution file is available.
+
+        Args:
+            group_id: Group containing the image.
+            shard: Message database shard containing the image.
+            local_id: Local image message ID.
+        """
+        with self.state:
+            self.state.execute(
+                'DELETE FROM image_fetch_attempts WHERE group_id=? AND shard=? AND local_id=?',
+                (group_id, shard, local_id),
+            )
+
+    def resolve_image(
+        self, account: Path, group_id: str, shard: str, item: Mapping[str, Any],
+    ) -> ImageCandidate:
+        """Prefer a full-resolution attachment, requesting it from WeChat once if needed.
+
+        Args:
+            account: Logged-in WeChat account directory.
+            group_id: Group containing the image.
+            shard: Message database shard containing the image.
+            item: Image message row.
+
+        Returns:
+            A decoded full-resolution image, or a disclosed preview fallback.
+
+        Raises:
+            ImageUnavailable: No usable local image variant exists.
+        """
+        full_paths = self.paths(account, group_id, item, include_previews=False)
+        full, _ = self.load_first(account, full_paths)
+        if full:
+            self.forget_fetch_attempt(group_id, shard, item['local_id'])
+            return full
+
+        all_paths = self.paths(account, group_id, item)
+        preview_paths = [path for path in all_paths if path.stem.endswith(('_b', '_t'))]
+        preview, preview_error = self.load_first(account, preview_paths)
+        if preview is None:
+            raise preview_error
+        _, _, preview_image, _ = preview
+        preview_hash = hashlib.sha256(preview_image).hexdigest()
+        should_fetch = (
+            self.image_fetcher is not None
+            and not self.fetch_attempted_recently(group_id, shard, item['local_id'], preview_hash)
+        )
+        opened = False
+        if should_fetch:
+            self.remember_fetch_attempt(group_id, shard, item['local_id'], preview_hash)
+            try:
+                self.image_fetcher(group_id, item, preview_image)
+            except (OSError, RuntimeError, ValueError):
+                pass
+            else:
+                opened = True
+            try:
+                if opened:
+                    deadline = time.monotonic() + 8
+                    while time.monotonic() < deadline:
+                        full_paths = self.paths(account, group_id, item, include_previews=False)
+                        full, _ = self.load_first(account, full_paths)
+                        if full:
+                            self.forget_fetch_attempt(group_id, shard, item['local_id'])
+                            return full
+                        time.sleep(0.4)
+            finally:
+                if opened and self.image_closer:
+                    try:
+                        self.image_closer(group_id)
+                    except (OSError, RuntimeError, ValueError):
+                        pass
+        if opened:
+            full_paths = self.paths(account, group_id, item, include_previews=False)
+            full, _ = self.load_first(account, full_paths)
+            if full:
+                self.forget_fetch_attempt(group_id, shard, item['local_id'])
+                return full
+        return preview
+
+    def describe(
+        self, account: Path, group_id: str, shard: str, item: Mapping[str, Any],
+    ) -> str:
+        """Describe one image, requesting a full-resolution local file first.
+
+        Args:
+            account: Logged-in WeChat account directory.
+            group_id: Group containing the image.
+            shard: Message database shard containing the image.
+            item: Image message row.
+
+        Returns:
+            A cached or newly generated Chinese image description.
+
+        Raises:
+            ImageUnavailable: No usable image variant could be read.
+        """
+        cached = self.cached(group_id, shard, item['local_id'])
+        if cached and '依据缩略图' not in cached and '依据微信预览图' not in cached:
+            return cached
+        try:
+            path, _, image, mime = self.resolve_image(account, group_id, shard, item)
+        except ImageUnavailable:
+            if cached:
+                return cached
+            raise
+        if cached and path.stem.endswith(('_b', '_t')):
+            return cached
+        summary, _ = self.ai.describe_image(image, mime)
+        if path.stem.endswith(('_b', '_t')):
+            summary = '（依据缩略图，原图未能读取）' + summary
+        with self.state:
+            self.state.execute('INSERT OR REPLACE INTO image_memory VALUES(?,?,?,?,?)',
+                (group_id, shard, item['local_id'], hashlib.sha256(image).hexdigest(), summary))
+        return summary

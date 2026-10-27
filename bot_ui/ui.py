@@ -1,5 +1,7 @@
 """Constrained X11 reply delivery to a manually verified, currently open group."""
+import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -8,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 from Xlib import display, error
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 
 ROOT = Path(__file__).resolve().parent
 os.environ['DISPLAY'] = ':1'
@@ -18,7 +20,19 @@ def xdo(*args):
     return subprocess.check_output(['xdotool', *map(str, args)], text=True, timeout=5).strip()
 
 
-def main_window(d):
+def main_window(d, expected_signature: dict[str, int | str] | None = None) -> Window:
+    """Find the unique visible WeChat window, optionally by its saved title.
+
+    Args:
+        d: X11 display connection.
+        expected_signature: Saved group title signature used to disambiguate windows.
+
+    Returns:
+        The visible WeChat main window.
+
+    Raises:
+        RuntimeError: The WeChat window is missing or ambiguous.
+    """
     prop = d.screen().root.get_full_property(d.intern_atom('_NET_CLIENT_LIST'), 0)
     candidates = []
     for identifier in prop.value if prop else []:
@@ -27,6 +41,10 @@ def main_window(d):
             g = w.get_geometry()
             if g.width >= 800 and g.height >= 600:
                 candidates.append(w)
+    if expected_signature:
+        matches = [w for w in candidates if signature(w) == expected_signature]
+        if matches:
+            candidates = matches
     if len(candidates) != 1:
         raise RuntimeError('Exactly one logged-in WeChat window is required')
     return candidates[0]
@@ -47,6 +65,118 @@ def verify(d, w, template):
     active = d.screen().root.get_full_property(d.intern_atom('_NET_ACTIVE_WINDOW'), 0)
     if not active or int(active.value[0]) != w.id:
         raise RuntimeError('WeChat is not the active window')
+
+
+def window_image(w: Window) -> Image.Image:
+    """Capture the current WeChat window as an RGB image.
+
+    Args:
+        w: Verified WeChat top-level window.
+
+    Returns:
+        An in-memory screenshot of the window.
+    """
+    geometry = w.get_geometry()
+    shot = w.get_image(0, 0, geometry.width, geometry.height, 2, 0xffffffff)
+    return Image.frombytes('RGB', (geometry.width, geometry.height), shot.data, 'raw', 'BGRX')
+
+
+def find_image_region(
+    screen: Image.Image, template: Image.Image,
+) -> tuple[int, int, int, int] | None:
+    """Locate a recent image bubble by matching its cached preview in the group pane.
+
+    Args:
+        screen: Screenshot of the current group window.
+        template: Decoded bubble preview for the target message.
+
+    Returns:
+        Window-relative image bounds, or None if the preview is not visible.
+    """
+    template = template.convert('RGB')
+    if min(template.size) < 48:
+        return None
+    left, top = min(320, max(180, screen.width // 3)), 70
+    right, bottom = screen.width - 15, screen.height - 110
+    if right <= left or bottom <= top:
+        return None
+    pane = screen.crop((left, top, right, bottom))
+    feature_size = (20, 20)
+    target = template.resize(feature_size, Image.Resampling.LANCZOS)
+    best_score, best_bounds = 256.0, None
+    for scale in (0.4, 0.55, 0.7, 0.85, 1.0, 1.2):
+        width = round(template.width * scale)
+        height = round(template.height * scale)
+        if width < 48 or height < 48 or width > pane.width or height > pane.height:
+            continue
+        step = max(5, min(width, height) // 30)
+        for y in range(0, pane.height - height + 1, step):
+            for x in range(0, pane.width - width + 1, step):
+                patch = pane.crop((x, y, x + width, y + height)).resize(
+                    feature_size, Image.Resampling.BILINEAR,
+                )
+                score = sum(ImageStat.Stat(ImageChops.difference(target, patch)).mean) / 3
+                lower_tie = bool(
+                    score == best_score and best_bounds and y > best_bounds[1]
+                )
+                if score < best_score or lower_tie:
+                    best_score = score
+                    best_bounds = (left + x, top + y, width, height)
+    return best_bounds if best_score <= 32 else None
+
+
+def open_image_preview(d, w: Window, template: str, preview: str) -> None:
+    """Open a uniquely matched image in its verified group so WeChat can fetch it.
+
+    Args:
+        d: X11 display connection.
+        w: Verified WeChat window.
+        template: Saved title signature for the intended group.
+        preview: Base64-encoded normalized image preview.
+
+    Raises:
+        ValueError: The preview is malformed or exceeds the size limit.
+        RuntimeError: The exact preview cannot be safely found onscreen.
+    """
+    if not isinstance(preview, str) or len(preview) > 6 * 1024 * 1024:
+        raise ValueError('Image preview exceeds the UI matching limit')
+    try:
+        raw = base64.b64decode(preview, validate=True)
+        with Image.open(io.BytesIO(raw)) as source:
+            if source.width * source.height > 4_000_000:
+                raise ValueError('Image preview exceeds the pixel limit')
+            source.load()
+            target = source.convert('RGB')
+    except (OSError, ValueError) as exc:
+        raise ValueError('Image preview could not be decoded') from exc
+
+    geometry = w.get_geometry()
+    scroll_x, scroll_y = geometry.width - 60, geometry.height // 2
+    xdo('key', '--clearmodifiers', 'Escape')
+    xdo('mousemove', '--window', w.id, scroll_x, scroll_y)
+    xdo('click', '--repeat', '16', '--delay', '12', '5')
+    time.sleep(.3)
+    match = None
+    clicked = False
+    try:
+        for page in range(6):
+            verify(d, w, template)
+            match = find_image_region(window_image(w), target)
+            if match:
+                break
+            if page < 5:
+                xdo('click', '--repeat', '4', '--delay', '20', '4')
+                time.sleep(.2)
+        if not match:
+            raise RuntimeError('Target image preview is not visible in the verified group')
+        verify(d, w, template)
+        x, y, width, height = match
+        xdo('mousemove', '--window', w.id, x + width // 2, y + height // 2, 'click', '1')
+        clicked = True
+    finally:
+        if not clicked and signature(w) == template:
+            xdo('mousemove', '--window', w.id, scroll_x, scroll_y)
+            xdo('click', '--repeat', '16', '--delay', '12', '5')
 
 
 def save_profile(path, profiles, group_id, group_name, value):
@@ -170,7 +300,8 @@ def select_group(w, group_name, unique_result=False):
     time.sleep(.4)
 
 
-def main():
+def main() -> None:
+    """Run one constrained, verified WeChat UI action."""
     action = sys.argv[1]
     payload = {} if action == 'logged-in' else json.load(sys.stdin)
     if action != 'logged-in':
@@ -179,13 +310,20 @@ def main():
         if not re.fullmatch(r'[0-9]+@chatroom', group_id) or not group_name.strip():
             raise ValueError('Explicit group ID and name are required')
     profiles_path = ROOT / 'titles.json'
+    profile_hint = None
+    if action == 'close-image':
+        profiles = json.loads(profiles_path.read_text()) if profiles_path.exists() else {}
+        profile_hint = profiles.get(group_id)
+        if not profile_hint or profile_hint.get('group_name') != group_name:
+            raise RuntimeError('Unverified target group')
     d = display.Display(':1')
-    w = main_window(d)
+    w = main_window(d, profile_hint.get('signature') if profile_hint else None)
     if action == 'logged-in':
         print('WeChat is logged in')
         return
-    xdo('windowactivate', '--sync', w.id)
-    time.sleep(.1)
+    if action != 'close-image':
+        xdo('windowactivate', '--sync', w.id)
+        time.sleep(.1)
     if action == 'capture-title':
         profiles = json.loads(profiles_path.read_text()) if profiles_path.exists() else {}
         save_profile(profiles_path, profiles, group_id, group_name, signature(w))
@@ -225,7 +363,34 @@ def main():
     if not profile or profile['group_name'] != group_name:
         raise RuntimeError('Unverified target group')
     template = profile['signature']
-    verify(d, w, template)
+    if action == 'close-image':
+        if signature(w) != template:
+            raise RuntimeError('Group title changed; image preview was left untouched')
+    else:
+        verify(d, w, template)
+    if action == 'open-image':
+        if type(payload.get('local_id')) is not int or payload['local_id'] <= 0:
+            raise ValueError('Invalid image message ID')
+        open_image_preview(d, w, template, payload.get('preview', ''))
+        print('Image preview opened in verified group')
+        return
+    if action == 'close-image':
+        if signature(w) != template:
+            raise RuntimeError('Group title changed; image preview was left untouched')
+        active = d.screen().root.get_full_property(d.intern_atom('_NET_ACTIVE_WINDOW'), 0)
+        if not active:
+            raise RuntimeError('No active window; image preview was left untouched')
+        active_window = d.create_resource_object('window', int(active.value[0]))
+        if 'wechat' not in str(active_window.get_wm_class()).lower():
+            raise RuntimeError('WeChat preview is not active; image preview was left untouched')
+        xdo('key', '--clearmodifiers', 'Escape')
+        time.sleep(.2)
+        verify(d, w, template)
+        geometry = w.get_geometry()
+        xdo('mousemove', '--window', w.id, geometry.width - 60, geometry.height // 2)
+        xdo('click', '--repeat', '16', '--delay', '12', '5')
+        print('Image preview closed in verified group')
+        return
     if action == 'check':
         print('Group title verified')
         return

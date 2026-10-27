@@ -1,5 +1,6 @@
 """All-group @ bot with isolated per-group memory and verified delivery."""
 import argparse
+import base64
 import ctypes
 import ctypes.util
 import fcntl
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+from typing import Any, Mapping
 
 from ai_client import AIClient
 from image_context import ImageUnavailable
@@ -157,6 +159,9 @@ class Bot:
         self.images = (ImageContext(ROOT, self.state, self.ai, self.config['bot_id'],
                                    ocr_enabled=self.config.get('ocr_enabled', True))
                        if self.config.get('vision_enabled', False) else None)
+        if self.images:
+            self.images.image_fetcher = self.fetch_original_image
+            self.images.image_closer = self.close_original_image
         self.stickers = (NativeStickers(self.ai, lambda group: self.ui('ready', group, allow_profile_refresh=True))
                          if self.config.get('stickers_enabled', False) else None)
         if self.stickers:
@@ -227,6 +232,42 @@ class Bot:
             detail = (result.stderr or '').strip().splitlines()
             raise RuntimeError('WeChat UI is not ready for ' + action +
                                (': ' + detail[-1][:200] if detail else ''))
+
+    def fetch_original_image(
+        self, group_id: str, item: Mapping[str, Any], preview: bytes,
+    ) -> None:
+        """Open a verified image preview in its own group to request WeChat's original.
+
+        Args:
+            group_id: Group containing the image.
+            item: Message row for the image being read.
+            preview: Normalized local preview used to locate that message onscreen.
+
+        Example:
+            fetch_original_image(group_id, image_row, preview_bytes)
+        """
+        if len(preview) > 4 * 1024 * 1024:
+            raise ValueError('Image preview exceeds the UI matching limit')
+        try:
+            self.ui('ready', group_id, allow_profile_refresh=True)
+            self.ui(
+                'open-image', group_id,
+                preview=base64.b64encode(preview).decode('ascii'),
+                local_id=int(item['local_id']),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError('WeChat UI timed out while opening the image') from exc
+
+    def close_original_image(self, group_id: str) -> None:
+        """Close the image preview after WeChat has had time to fetch it.
+
+        Args:
+            group_id: Group whose verified title must still be visible.
+        """
+        try:
+            self.ui('close-image', group_id)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError('WeChat UI timed out while closing the image') from exc
 
     def poll(self):
         # No constant group switching: collect messages first; select only when sending.
