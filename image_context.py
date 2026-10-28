@@ -20,6 +20,7 @@ from PIL import Image
 
 
 MAX_BYTES = 12 * 1024 * 1024
+IMAGE_DOWNLOAD_WAIT_SECONDS = 5
 ImageCandidate = tuple[Path, bytes, bytes, str]
 
 
@@ -324,17 +325,23 @@ class ImageContext:
         Raises:
             ImageUnavailable: No usable local image variant exists.
         """
-        full_paths = self.paths(account, group_id, item, include_previews=False)
-        full, _ = self.load_first(account, full_paths)
-        if full:
-            self.forget_fetch_attempt(group_id, shard, item['local_id'])
-            return full
-
-        all_paths = self.paths(account, group_id, item)
-        preview_paths = [path for path in all_paths if path.stem.endswith(('_b', '_t'))]
-        preview, preview_error = self.load_first(account, preview_paths)
-        if preview is None:
-            raise preview_error
+        deadline = time.monotonic() + IMAGE_DOWNLOAD_WAIT_SECONDS
+        preview: ImageCandidate | None = None
+        preview_error: ImageUnavailable = ImageUnavailable('这张图片还没有下载到本机')
+        while preview is None:
+            full_paths = self.paths(account, group_id, item, include_previews=False)
+            full, _ = self.load_first(account, full_paths)
+            if full:
+                self.forget_fetch_attempt(group_id, shard, item['local_id'])
+                return full
+            all_paths = self.paths(account, group_id, item)
+            preview_paths = [path for path in all_paths if path.stem.endswith(('_b', '_t'))]
+            preview, preview_error = self.load_first(account, preview_paths)
+            if preview is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise preview_error
+                time.sleep(min(0.4, remaining))
         _, _, preview_image, _ = preview
         preview_hash = hashlib.sha256(preview_image).hexdigest()
         should_fetch = (
